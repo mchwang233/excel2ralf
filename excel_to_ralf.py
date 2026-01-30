@@ -80,9 +80,9 @@ def load_excel(path, sheet):
     if missing:
         raise ValueError(f"Excel 缺少列: {missing}")
 
-    # 关键修改：向下填充 BlockName/RegName/RegOffset，
+    # 关键修改：向下填充 BlockName/RegName/RegOffset/Hierarchy，
     # 以支持只在首行填写，其余行留空的写法
-    for col in ["BlockName", "RegName", "RegOffset"]:
+    for col in ["BlockName", "RegName", "RegOffset", "Hierarchy"]:
         if col in df.columns:
             df[col] = df[col].ffill()
 
@@ -105,15 +105,25 @@ def generate_ralf(df, bytes_per_word=4):
     for block_name, block_df in df.groupby("BlockName", sort=False):
         block_name = sanitize(block_name) or "TOP"
 
+        # 针对当前 block 读取 Hierarchy 列（如果存在），取该 block 中第一行的值
+        # 生成供 field 名称使用的后门前缀，例如：`PRCM_hierarchyU_apb_slvtop.slvif.ff_regb_ddrc_ch0_lpddr5
+        hierarchy_macro = ""
+        hierarchy_inst = ""
+        if "Hierarchy" in block_df.columns:
+            first_h = sanitize(block_df["Hierarchy"].iloc[0])
+            if first_h:
+                hierarchy_macro = f"`{block_name}_hierarchy{first_h}"
+                hierarchy_inst = first_h
+
         if not first_block:
             lines.append("")
         first_block = False
 
-        # block 头部 + bytes 行（例如：block DWC_ddrctl_axi_0_AXI_Port0_block {\n  bytes 4;）
+    # block 头部 + bytes 行（例如：block DWC_ddrctl_axi_0_AXI_Port0_block {\n  bytes 4;）
         lines.append(f"block {block_name} {{")
         lines.append(f"  bytes {bytes_per_word};")
 
-        # 在 block 内按 (RegName, RegOffset) 分寄存器
+    # 在 block 内按 (RegName, RegOffset) 分寄存器
         for (reg_name, offset), reg_df in block_df.groupby(
             ["RegName", "RegOffset"], sort=False
         ):
@@ -132,8 +142,13 @@ def generate_ralf(df, bytes_per_word=4):
 
             # 为该寄存器生成字段
             for _, row in reg_df.iterrows():
-                fname = sanitize(row["FieldName"])
+                base_fname = sanitize(row["FieldName"])
+                fname = base_fname
                 if not fname:
+                    continue
+
+                # 如果字段名为 reserved（忽略大小写），则不生成该 field
+                if base_fname.strip().lower() == "reserved":
                     continue
 
                 bit_raw = row["Bit"]
@@ -148,6 +163,9 @@ def generate_ralf(df, bytes_per_word=4):
 
                 faccess = str(row["Access"]).strip() or "rw"
                 faccess = faccess.lower()
+                # 如果为只读 "r"，输出为 "ro" 以符合 RALF 访问类型习惯
+                if faccess == "r":
+                    faccess = "ro"
 
                 # reset: 使用 WIDTH'hHEX 形式
                 rv_int = parse_reset_value(row["ResetValue"])
@@ -157,6 +175,14 @@ def generate_ralf(df, bytes_per_word=4):
                     mask = (1 << width) - 1
                     rv_field = rv_int & mask
                     reset_str = f"{width}'h{rv_field:X}"
+
+                # 如果存在 Hierarchy 信息，则将 field 名扩展为
+                #   field <原始字段名> (<Hierarchy 实例路径>) @<lsb> {
+                # 例如：field lpddr5 (U_apb_slvtop.slvif.ff_regb_ddrc_ch0_lpddr5) @3 {
+                if "Hierarchy" in reg_df.columns:
+                    h_val = sanitize(row["Hierarchy"])
+                    if h_val:
+                        fname = f"{base_fname} ({h_val})"
 
                 lines.append(f"        field {fname} @{lsb} {{")
                 lines.append(f"           bits {width};")
